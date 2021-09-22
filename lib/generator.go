@@ -421,7 +421,7 @@ func rewriteTestNode(n ast.Node, test Test) (ast.Node, error) {
 				t := strings.Split(s, ":")
 				v.Value = fmt.Sprintf(`atgenVars["%s"].(%s)`, t[0], t[1])
 			} else if strings.HasPrefix(v.Value, `"$atgenRegister[`) {
-				v.Value = replaceRegister(v.Value)
+				cr.Replace(replaceRegister(v.Value))
 			}
 		}
 		return true
@@ -481,22 +481,43 @@ func addAdditionalImports(typ Type, fset *token.FileSet, f *ast.File) {
 	}
 }
 
-func replaceRegister(str string) string {
+func replaceRegister(str string) ast.Expr {
 	s := strings.TrimPrefix(str, `"$atgenRegister[`)
 	s = strings.TrimSuffix(s, `]"`)
 	t := strings.Split(s, ".")
-	var value = "atgenRegister"
-	for i := 0; i < len(t); i++ {
-		if i > 0 {
-			value += ".(map[string]interface{})"
-		}
-		if strings.Contains(t[i], "[") {
-			rep := regexp.MustCompile(`(.+)\[(\d)\]`)
-			value += rep.ReplaceAllString(t[i], `["$1"].([]interface{})[$2]`)
-		} else {
-			value += fmt.Sprintf(`["%s"]`, t[i])
+	var funcbody []string
+	genAssertBody := func(nextVar, assertion, errloc string) []string {
+		return []string{
+			fmt.Sprintf("%s, ok := %s", nextVar, assertion),
+			"if !ok {",
+			fmt.Sprintf("panic(`failed to assert atgenRegister[%s] as %s`)", errloc, assertion),
+			"}",
 		}
 	}
-	value += ".(string)"
-	return value
+	prevVar := "atgenRegister"
+	objVar := "atgenRegister"
+	for i := range t {
+		if i > 0 {
+			objVar = fmt.Sprintf("obj%d", i)
+			funcbody = append(funcbody, genAssertBody(objVar, prevVar+".(map[string]interface{})", strings.Join(t[:i], "."))...)
+		}
+		newVar := fmt.Sprintf("v%d", i)
+		if strings.Contains(t[i], "[") {
+			arrVar := newVar + "a"
+			rep := regexp.MustCompile(`(.+)\[(\d+)\]`)
+			// map はゼロ値が返るので参照しても問題ない
+			funcbody = append(funcbody, genAssertBody(arrVar, objVar+rep.ReplaceAllString(t[i], `["$1"].([]interface{})`), strings.Join(t[:i], "."))...)
+			index := rep.ReplaceAllString(t[i], "$2")
+			funcbody = append(funcbody, fmt.Sprintf(`if len(%s) <= %s { panic("failed to assert atgenRegister[%s]: out of range") }`, arrVar, index, strings.Join(t[:i+1], ".")))
+			funcbody = append(funcbody, fmt.Sprintf(`%s := %s[%s]`, newVar, arrVar, index))
+		} else {
+			funcbody = append(funcbody, fmt.Sprintf(`%s := %s["%s"]`, newVar, objVar, t[i]))
+		}
+		prevVar = newVar
+	}
+	funcbody = append(funcbody, genAssertBody("final", prevVar+".(string)", s)...)
+	funcbody = append(funcbody, "return final")
+	generated := fmt.Sprintf("(func()string{\n%s\n})()", strings.Join(funcbody, "\n"))
+	expr, _ := parser.ParseExpr(generated)
+	return expr
 }
